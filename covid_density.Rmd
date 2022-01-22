@@ -1,0 +1,198 @@
+---
+title: "COVID-19 County Data"
+author: "Mark Herrera"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(readr)
+library(zoo)
+```
+
+## Data Input and Parsing
+```{r,results='hide',warning=FALSE}
+#Tell me where to find the latest and greatest COVID DATA
+jhu_url <- paste("https://raw.githubusercontent.com/CSSEGISandData/",
+                 "COVID-19/master/csse_covid_19_data/", "csse_covid_19_time_series/",
+                 "time_series_covid19_confirmed_US.csv", sep = "")
+
+votes_url <- paste("https://raw.githubusercontent.com/tonmcg/",
+                   "US_County_Level_Election_Results_08-16/master/",
+                   "2016_US_County_Level_Presidential_Results.csv",sep = "")
+
+census_url <- paste("https://www2.census.gov/programs-surveys/popest/",
+                    "datasets/2010-2019/counties/totals/co-est2019-alldata.csv",sep = "")
+
+abbrev_url <- paste("https://raw.githubusercontent.com/jasonong/",
+                    "List-of-US-States/master/states.csv",sep = "")
+```
+
+
+Begin by reading in the voting and covid data.  
+```{r}
+#Read in Voting Data 
+votes <- read_csv(votes_url) %>%
+  rename(FIPS="combined_fips")
+
+#Combine COVID + Voting Data
+covidData <-
+  read_csv(jhu_url) %>%
+  rename(province = "Province_State",
+         country_region = "Country_Region",
+         county="Admin2")  %>%
+  select(-c(UID,iso2,iso3,code3,country_region,Lat,Long_,Combined_Key)) %>% 
+  pivot_longer(-c(province,county,FIPS), names_to = "d", 
+               values_to = "cumulative_cases") %>%
+  separate(d,c("Month","Day","Year"),sep="/") %>%
+  mutate(dstring=sprintf("%02i/%02i/%02i",   #some parsing to make dates work correctly
+                         as.numeric(Month), 
+                         as.numeric(Day), 
+                         as.numeric(Year)),
+         d=as.Date(dstring,"%m/%d/%y")) %>%
+  select(d,county,province,FIPS,cumulative_cases) %>%
+  arrange(d) %>%
+  mutate(FIPS=ifelse(FIPS==46102,46113,FIPS)) %>%
+  group_by(FIPS) %>%  #for each FIPS ID, calculate new cases per day
+  mutate(new_cases = cumulative_cases-dplyr::lag(cumulative_cases,1)) %>%
+  ungroup() %>%
+  left_join(select(votes,FIPS,votes_dem,votes_gop),by="FIPS") %>%  #add voting data for each FIPS ID
+  mutate(elect = ifelse(votes_dem > votes_gop,"Clinton","Trump"))
+```
+
+Now read in the state abbreviation table, and figure out state voting data.
+```{r,results='hide',warning=FALSE}
+#Read in State Abbreviation Data
+states <- read_csv(abbrev_url) %>%
+  rename(province="State",
+         state_abbr="Abbreviation")
+
+#Aggreate voting data by state vice county
+votes_state = votes %>%
+  group_by(state_abbr) %>%
+  summarize(votes_dem=sum(votes_dem),votes_gop=sum(votes_gop)) %>%
+  mutate(elect = ifelse(votes_dem > votes_gop,"Clinton","Trump")) %>%
+  left_join(states,by="state_abbr")
+```
+
+Read in population data and add the 2019 estimate for population into the COVID data.
+```{r}
+#Read in Population Data
+co_est2019_alldata =
+  read_csv(census_url) %>%
+  select(STATE,COUNTY,POPESTIMATE2019) %>%
+  rename(population="POPESTIMATE2019") %>%
+  mutate(FIPS=as.numeric(str_c(as.character(STATE),as.character(COUNTY)))) %>%
+    mutate(FIPS=ifelse(FIPS==46102,46113,FIPS))
+
+
+#Combine Covid and population Data
+covidData =
+  covidData %>%
+  left_join(select(co_est2019_alldata,FIPS,population),by="FIPS") %>%
+  filter(!is.na(population))
+```
+
+
+## County Density Plots
+```{r}
+countyCovid=covidData %>%
+  ungroup() %>%
+  filter(!is.na(elect)) %>%
+  mutate(ncap=new_cases/population) %>%
+  group_by(FIPS) %>%
+  arrange(d) %>%
+  mutate(rncap=rollmean(ncap,7,fill=NA,align="right")) %>%
+  mutate(rnew=rollmean(new_cases,7,fill=NA,align="right"))
+
+```
+
+
+And a plot! NOTE: To show off some detail in the plot, any county where the number of new cases per 100,000 people is > $cmax$ (set to 150), we set the value of the new case rate to $cmax$.   
+```{r}
+library(mapdata)
+library(viridis)
+library(plotly)
+cmax=150
+
+votes=votes %>%
+  mutate(elect = ifelse(votes_dem > votes_gop,"Clinton","Trump"))
+
+
+data(county.fips)
+cfips=county.fips %>%
+  mutate(polyname=str_remove_all(polyname,pattern=":.*")) 
+  
+
+#lets look at the map of the US on a specific date.  
+dCovid = covidData %>%
+  ungroup() %>%
+  mutate(ncap=new_cases/population*1e5) %>%
+  group_by(FIPS) %>%
+  mutate(rnew=rollmean(new_cases,7,fill=NA,align="right")) %>%
+  mutate(rncap=rollmean(ncap,7,fill=NA,align="right")) %>%
+  ungroup()
+
+
+
+
+ddCovid=dCovid %>%
+  filter(d==max(d))
+
+states <- map_data("state")
+
+
+counties=map_data("county") %>%
+  mutate(polyname=str_c(region,',',subregion)) %>%
+  left_join(cfips,by="polyname") %>%
+  rename(FIPS="fips") %>%
+  left_join(ddCovid,by="FIPS")
+
+
+p1=counties %>%
+  mutate(rncap =ifelse(rncap>cmax,cmax,rncap)) %>%
+  mutate(rncap =ifelse(rncap<0,0,rncap)) %>%
+  ggplot() +
+  aes(x = long, y = lat,group=group) +
+  geom_polygon(aes(fill=rncap,subgroup=subregion),size=0.1) +
+  theme_bw()+
+  theme(axis.line=element_blank(),axis.text.x=element_blank(),
+          axis.text.y=element_blank(),axis.ticks=element_blank(),
+          axis.title.x=element_blank(),
+          axis.title.y=element_blank(),
+        legend.position = "bottom")+
+  scale_fill_viridis(option="B",) +
+  geom_path(data=states,color="gray",size=0.4) +
+  labs(fill = "New Cases \n per 100,000")  +
+  ggtitle("New COVID-19 Cases Per Capita \n (7-Day Rolling Average)",
+          subtitle=ddCovid$d[1]) 
+  
+
+
+p1
+```
+
+```{r,eval=FALSE}
+library(rayshader)
+
+plot_gg(p1, width = 6, height=5, windowsize = c(1026, 814),
+        zoom = 0.6, phi = 25, theta = 30,
+        max_error=0.01,triangulate = TRUE,
+        soliddepth=-50)
+
+
+
+
+```
+
+
