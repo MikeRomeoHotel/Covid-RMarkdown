@@ -1,0 +1,175 @@
+---
+title: "Virginia-COVID"
+author: "Mark"
+date: "01/21/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(scales)
+library(zoo)
+```
+
+Read that terrible data in
+```{r}
+library(readr)
+VACOVID <- read_csv("https://data.virginia.gov/api/views/bre9-aqqr/rows.csv") %>%
+  rename(d=`Report Date`, 
+         cumulative_cases=`Total Cases`,
+         hospitalization=`Hospitalizations`,
+         deaths = `Deaths`) %>%
+  mutate(d=as.Date(d,"%m/%d/%Y"))  %>%
+  arrange(d) %>%
+  group_by(FIPS) %>%  #for each FIPS ID, calculate new cases per day
+  mutate(new_cases = cumulative_cases-dplyr::lag(cumulative_cases,1))  %>%
+  mutate(new_deaths = deaths-dplyr::lag(deaths,1))  %>%
+  mutate(new_hosp = hospitalization-dplyr::lag(hospitalization,1))  %>%
+  ungroup() 
+```
+
+
+```{r}
+census_url <- paste("https://www2.census.gov/programs-surveys/popest/",
+                    "datasets/2010-2019/counties/totals/co-est2019-alldata.csv",
+                    sep = "")
+
+#Read in Population Data
+co_est2019_alldata =
+  read_csv(census_url) %>%
+  select(STATE,COUNTY,POPESTIMATE2019) %>%
+  rename(population="POPESTIMATE2019") %>%
+  mutate(FIPS=as.numeric(str_c(as.character(STATE),as.character(COUNTY)))) 
+
+
+
+#Combine Covid and population Data
+VACOVID =
+  VACOVID %>%
+  left_join(select(co_est2019_alldata,FIPS,population),by="FIPS") %>%
+  filter(!is.na(population)) 
+```
+
+## Calculate Rolling Averages and Plot Prep
+
+
+```{r}
+Nd=14
+# calculate Nd day rolling averages
+VACOVID = VACOVID %>%
+  group_by(FIPS) %>%
+  mutate(rnew=rollmean(new_cases,Nd,fill=NA,align="right")) %>%
+  mutate(rdnew=rollmean(new_deaths,Nd,fill=NA,align="right")) %>%
+  mutate(rhnew=rollmean(new_hosp,Nd,fill=NA,align="right")) %>%
+  ungroup()
+```
+
+
+Simple Plots
+```{r}
+
+locallist = c("Fairfax","Alexandria","Norfolk")
+p1=VACOVID %>%
+  dplyr::filter(Locality %in% locallist) %>%
+  ggplot() +
+  aes(x=d,y=new_cases/population * 1e5) +
+  geom_bar(color="gray",stat="identity",alpha=0.0) +
+  geom_line(aes(y=rnew/population * 1e5),color="black") +
+  facet_grid(Locality~. ) +
+  theme_bw() +
+  scale_x_date(breaks = date_breaks("2 month"), 
+                                           labels = date_format("%b %y")) +
+  scale_y_continuous(labels = comma) +
+  ylab("New Cases per 100k") +
+  xlab("") 
+```
+
+```{r}
+p2=VACOVID %>%
+  dplyr::filter(Locality %in% locallist) %>%
+  ggplot() +
+  aes(x=d,y=new_hosp/population * 1e5) +
+  geom_bar(color="gray",fill="blue",stat="identity",alpha=0.3) +
+
+  geom_line(aes(y=rhnew/population * 1e5),color="blue") +
+  facet_grid(Locality~. ) +
+  theme_bw() +
+  scale_x_date(breaks = date_breaks("2 month"), 
+                                           labels = date_format("%b %y")) +
+  scale_y_continuous(labels = comma) +
+  ylab("New Hospitalizations per 100k")+
+  xlab("")
+
+```
+
+```{r}
+p3=VACOVID %>%
+  dplyr::filter(Locality %in% locallist) %>%
+  ggplot() +
+  aes(x=d,y=new_deaths/population * 1e5) +
+  geom_bar(color="gray",stat="identity") +
+  geom_line(aes(y=rdnew/population * 1e5),color="red") +
+
+  facet_grid(Locality~. ) +
+  theme_bw() +
+  scale_x_date(breaks = date_breaks("2 month"), 
+                                           labels = date_format("%b %y")) +
+  scale_y_continuous(labels = comma) +
+  ylab("New Deaths per 100k")+
+  xlab("Date")
+```
+
+```{r}
+plotly::ggplotly(p1)
+plotly::ggplotly(p2)
+plotly::ggplotly(p3)
+```
+
+
+
+
+#Simple Features?
+```{r}
+novalist = c("Fairfax")
+
+library(urbnmapr) 
+library(viridisLite)
+counties_sf <- get_urbn_map("counties", sf = TRUE) %>%
+  filter(state_name=="Virginia") %>%
+  rename(FIPS=county_fips) %>%
+  mutate(FIPS=as.numeric(FIPS))
+
+#let's look at a map of TODAY
+dd = max(VACOVID$d)
+
+VAtoday = VACOVID %>%
+  filter(d==dd) 
+
+counties_sf <- 
+  left_join(counties_sf,VAtoday,by="FIPS") %>%
+  mutate(`New Hospitalizations Per Million`= rhnew/population*1e6) %>%
+  # filter(Locality %in% novalist) %>%
+  mutate(`New Hospitalizations Per Million`=ifelse(`New Hospitalizations Per Million`<0,0,`New Hospitalizations Per Million`))
+
+
+
+VVplot <- ggplot() +
+  geom_sf(data=counties_sf,
+          aes(fill=`New Hospitalizations Per Million`,
+              color=`New Hospitalizations Per Million`)) +
+  coord_sf(crs = "+proj=merc") +
+  theme_bw() +
+  scale_fill_viridis_c("per million",option="inferno") +
+  scale_color_viridis_c("per million",option="inferno") +
+  ggtitle(paste("Virginia: New Daily Hospitalizations Per-Capita"),
+          subtitle=as.character(dd))
+
+plot(VVplot)
+```
+
+
+
+
+
+
